@@ -39,9 +39,15 @@ def silence_threshold_samples(
 class RealtimeVad:
     """Streaming Silero VAD via sherpa-onnx. One instance per WS session."""
 
-    def __init__(self, model_path: Path | None = None, sample_rate: int = TARGET_SR):
+    def __init__(
+        self,
+        model_path: Path | None = None,
+        sample_rate: int = TARGET_SR,
+        eos_ms: int | None = None,
+    ):
         self.sample_rate = sample_rate
         self.model_path = Path(model_path or VAD_MODEL_PATH)
+        self.eos_ms = int(eos_ms if eos_ms is not None else WS_EOS_SILENCE_MS)
         self._vad = None
         self._window = 512
         self._pending = np.zeros(0, dtype=np.float32)
@@ -69,7 +75,7 @@ class RealtimeVad:
             if window:
                 self._window = int(window)
             self._enabled = True
-            log.info("RealtimeVad ready | model={} eos_ms={}", self.model_path, WS_EOS_SILENCE_MS)
+            log.info("RealtimeVad ready | model={} eos_ms={}", self.model_path, self.eos_ms)
         except Exception as e:
             log.error("RealtimeVad init failed: {} — fallback always-speech", e)
             self._vad = None
@@ -113,7 +119,7 @@ class RealtimeVad:
             needed = silence_threshold_samples(
                 self._speech_samples,
                 self.sample_rate,
-                WS_EOS_SILENCE_MS,
+                self.eos_ms,
                 WS_EARLY_SILENCE_MS,
                 WS_COMMITTED_SPEECH_SECONDS,
             )

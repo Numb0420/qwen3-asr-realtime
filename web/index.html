@@ -89,7 +89,7 @@
 <body>
   <div class="card">
     <h1>实时语音转写</h1>
-    <p class="hint">点开始采集麦克风并推流；点停止发送 stop。静音超时或满 60 秒也会自动结束。</p>
+    <p class="hint">点开始采集麦克风并推流；点停止发送 status=2。静音超时或满 60 秒也会自动结束。</p>
     <div class="row">
       <button id="btn-start" type="button">开始</button>
       <button id="btn-stop" type="button" disabled>停止</button>
@@ -110,6 +110,7 @@
     let processor = null;
     let source = null;
     let sending = false;
+    let firstFrame = true;
     let livePartial = "";
 
     function setStatus(msg, kind) {
@@ -154,9 +155,19 @@
       return out;
     }
 
+    function pcmToBase64(int16) {
+      const bytes = new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength);
+      let bin = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(bin);
+    }
+
     function wsUrl() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      return `${proto}//${location.host}/realtime/stream?sample_rate=${TARGET_SR}&use_server_vad=true`;
+      return `${proto}//${location.host}/realtime/stream`;
     }
 
     async function stopCapture() {
@@ -236,6 +247,7 @@
     async function start() {
       if (sending) return;
       livePartial = "";
+      firstFrame = true;
       textEl.value = "";
       setStatus("请求麦克风…");
       setRecording(true);
@@ -305,7 +317,12 @@
         );
         carry = next;
         if (!samples.length) return;
-        ws.send(floatToPcm16(samples).buffer);
+        const audio = pcmToBase64(floatToPcm16(samples));
+        const data = firstFrame
+          ? { status: 0, format: "audio/L16;rate=16000", audio }
+          : { status: 1, audio };
+        firstFrame = false;
+        ws.send(JSON.stringify({ data }));
       };
       const mute = audioCtx.createGain();
       mute.gain.value = 0;
@@ -323,7 +340,7 @@
       await stopCapture();
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(JSON.stringify({ action: "stop" }));
+          ws.send(JSON.stringify({ data: { status: 2 } }));
         } catch (_) {}
       } else {
         setRecording(false);

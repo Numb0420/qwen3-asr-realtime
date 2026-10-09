@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 import time
@@ -24,7 +25,6 @@ if str(VENDOR) not in sys.path:
 from backend import QwenGGUFBackend
 from backend.base import BackendState
 from config import (
-    ASR_USE_SERVER_VAD,
     FORMAT_NUM,
     HOST,
     LLM_FN,
@@ -95,6 +95,27 @@ def _ws_preview(text: str, limit: int = 48) -> str:
 
 def _pcm_to_float(pcm: bytes) -> np.ndarray:
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+L16_FORMAT_16K = "audio/L16;rate=16000"
+L16_FORMAT_8K = "audio/L16;rate=8000"
+_L16_RATES = {
+    "audio/l16;rate=16000": 16000,
+    "audio/l16;rate=8000": 8000,
+}
+
+
+def _parse_l16_format(value: str | None) -> int | None:
+    raw = "".join(str(value or "").split()).lower()
+    return _L16_RATES.get(raw)
+
+
+def _l16_format_for_sr(sample_rate: int) -> str:
+    return L16_FORMAT_8K if int(sample_rate) == 8000 else L16_FORMAT_16K
+
+
+def _b64_pcm_to_bytes(audio_b64: str) -> bytes:
+    return base64.b64decode(audio_b64, validate=False)
 
 
 async def _ensure_model_loaded() -> None:
@@ -339,31 +360,10 @@ async def websocket_transcribe(websocket: WebSocket):
     ws_req_id = websocket.query_params.get("request_id") or str(_uuid_module.uuid4())
     token = set_request_id(ws_req_id)
 
-    use_vad = ASR_USE_SERVER_VAD
-    vad_param = websocket.query_params.get("use_server_vad")
-    if vad_param is not None:
-        use_vad = vad_param.lower() in ("true", "1", "yes")
+    client_sr = TARGET_SR
+    got_first = False
 
-    client_sr = int(websocket.query_params.get("sample_rate", str(TARGET_SR)))
-    if client_sr not in (8000, 16000):
-        await websocket.send_json({
-            "code": "UNSUPPORTED_SAMPLE_RATE",
-            "message": f"sample_rate must be 8000 or 16000, got {client_sr}",
-            "statusCode": 400,
-        })
-        await websocket.close()
-        async with _ws_lock:
-            if _active_ws is websocket:
-                _active_ws = None
-        reset_request_id(token)
-        return
-
-    log.info(
-        "[WS] Client connected | request_id={} use_vad={} sample_rate={}",
-        ws_req_id,
-        use_vad,
-        client_sr,
-    )
+    log.info("[WS] Client connected | request_id={}", ws_req_id)
     await infer_queue.open_session(ws_req_id)
 
     lang_code: str | None = None
@@ -562,94 +562,26 @@ async def websocket_transcribe(websocket: WebSocket):
             "status": "connected",
             "session_id": ws_req_id,
             "sample_rate": client_sr,
-            "format": "pcm_s16le",
+            "format": _l16_format_for_sr(client_sr),
             "partial_seconds": WS_PARTIAL_SECONDS,
             "max_audio_seconds": WS_MAX_AUDIO_SECONDS,
             "eos_silence_ms": WS_EOS_SILENCE_MS,
             "early_silence_ms": WS_EARLY_SILENCE_MS,
             "vad_pre_roll_ms": WS_VAD_PRE_ROLL_MS,
-            "use_server_vad": use_vad,
         })
 
-        while True:
-            if session_phase != "listening":
-                break
-            data = await websocket.receive()
-            if data.get("type") == "websocket.disconnect":
-                break
-            if session_phase != "listening":
-                break
-
-            if "text" in data:
-                try:
-                    msg = json.loads(data["text"])
-                except json.JSONDecodeError:
-                    await _send({
-                        "code": "INVALID_JSON",
-                        "message": "Invalid JSON command",
-                        "statusCode": 400,
-                    })
-                    continue
-                action = msg.get("action", "")
-                if action == "reset":
-                    log.info(
-                        "WS reset | cursor={:.3f} buf={:.3f}s",
-                        stream_samples / TARGET_SR,
-                        speech_buf.size / TARGET_SR if speech_buf.size else 0.0,
-                    )
-                    speech_buf = np.zeros(0, dtype=np.float32)
-                    pre_roll = np.zeros(0, dtype=np.float32)
-                    last_partial_at = 0
-                    vad.reset()
-                    buffer_audio_start = stream_samples / TARGET_SR
-                    await _cancel_speculative("reset")
-                    backend.clear_encoder_cache(ws_req_id)
-                    await _send({"status": "buffer_reset"})
-                elif action == "config":
-                    new_lang = msg.get("language")
-                    if new_lang == "auto":
-                        lang_code = None
-                    elif new_lang:
-                        lang_code = new_lang
-                    if "use_server_vad" in msg:
-                        use_vad = bool(msg["use_server_vad"])
-                    await _send({
-                        "status": "configured",
-                        "language": lang_code or "auto",
-                        "use_server_vad": use_vad,
-                    })
-                elif action == "stop":
-                    await _finish_session("stop")
-                    break
-                else:
-                    await _send({
-                        "code": "UNKNOWN_ACTION",
-                        "message": f"Unknown action: {action!r}",
-                        "statusCode": 400,
-                    })
-                continue
-
-            if "bytes" not in data or not accept_pcm or session_phase != "listening":
-                continue
-
-            incoming = data["bytes"]
-            if client_sr != TARGET_SR:
-                incoming = _resample_pcm_bytes(incoming, client_sr)
-            chunk = _pcm_to_float(incoming)
+        async def _ingest_pcm(chunk: np.ndarray) -> str | None:
+            nonlocal speech_buf, pre_roll, stream_samples, last_partial_at, buffer_audio_start
+            if chunk.size == 0:
+                return None
             remaining = max_samples - stream_samples
             if remaining <= 0:
-                await _finish_session("max_duration")
-                break
+                return "max_duration"
             if chunk.size > remaining:
                 chunk = chunk[:remaining]
-
             pre_roll = append_pre_roll(pre_roll, chunk, pre_roll_samples)
-            if use_vad:
-                event = vad.accept_audio(chunk)
-            else:
-                event = type("E", (), {"is_speech": True, "speech_ended": False, "silence_ms": 0.0, "committed": False})()
+            event = vad.accept_audio(chunk)
             stream_samples += int(chunk.size)
-
             if event.is_speech or speech_buf.size > 0:
                 if speech_buf.size == 0:
                     unused = unused_pre_roll(pre_roll, chunk)
@@ -664,34 +596,27 @@ async def websocket_transcribe(websocket: WebSocket):
                         buffer_audio_start,
                     )
                 speech_buf = np.concatenate([speech_buf, chunk]) if speech_buf.size else chunk.copy()
-
             if stream_samples >= max_samples:
-                await _finish_session("max_duration")
-                break
-
+                return "max_duration"
             silence_ms = float(getattr(event, "silence_ms", 0.0) or 0.0)
             committed = bool(getattr(event, "committed", False))
-            if use_vad and silence_ms <= 0.0 and speculative_task is not None:
+            if silence_ms <= 0.0 and speculative_task is not None:
                 await _cancel_speculative("speech")
             if (
-                use_vad
-                and WS_SPECULATIVE_FINAL_MS > 0
+                WS_SPECULATIVE_FINAL_MS > 0
                 and committed
                 and silence_ms >= float(WS_SPECULATIVE_FINAL_MS)
                 and not event.speech_ended
             ):
                 _spawn_speculative()
-
-            if use_vad and event.speech_ended and speech_buf.size > 0:
+            if event.speech_ended and speech_buf.size > 0:
                 log.info(
                     "WS eos | reason=silence cursor={:.3f} buf={:.3f}s silence_ms={:.0f}",
                     stream_samples / TARGET_SR,
                     speech_buf.size / TARGET_SR,
                     silence_ms,
                 )
-                await _finish_session("silence")
-                break
-
+                return "silence"
             if (
                 session_phase == "listening"
                 and silence_ms < float(WS_SPECULATIVE_FINAL_MS or 10**9)
@@ -700,6 +625,167 @@ async def websocket_transcribe(websocket: WebSocket):
             ):
                 last_partial_at = speech_buf.size
                 _spawn_partial()
+            return None
+
+        while True:
+            if session_phase != "listening":
+                break
+            data = await websocket.receive()
+            if data.get("type") == "websocket.disconnect":
+                break
+            if session_phase != "listening":
+                break
+
+            if "bytes" in data:
+                await _send({
+                    "code": "INVALID_FRAME",
+                    "message": "binary PCM is not supported; send JSON {\"data\":{...}}",
+                    "statusCode": 400,
+                })
+                continue
+            if "text" not in data:
+                continue
+
+            try:
+                msg = json.loads(data["text"])
+            except json.JSONDecodeError:
+                await _send({
+                    "code": "INVALID_JSON",
+                    "message": "Invalid JSON command",
+                    "statusCode": 400,
+                })
+                continue
+            payload = msg.get("data") if isinstance(msg, dict) else None
+            if not isinstance(payload, dict):
+                await _send({
+                    "code": "INVALID_ENVELOPE",
+                    "message": "expected {\"data\": {status, format, audio}}",
+                    "statusCode": 400,
+                })
+                continue
+            if not accept_pcm or session_phase != "listening":
+                continue
+
+            try:
+                frame_status = int(payload["status"])
+            except (KeyError, TypeError, ValueError):
+                await _send({
+                    "code": "INVALID_STATUS",
+                    "message": "data.status is required and must be 0, 1, or 2",
+                    "statusCode": 400,
+                })
+                continue
+            if frame_status not in (0, 1, 2):
+                await _send({
+                    "code": "INVALID_STATUS",
+                    "message": f"data.status must be 0, 1, or 2, got {frame_status}",
+                    "statusCode": 400,
+                })
+                continue
+            if frame_status == 0 and got_first:
+                await _send({
+                    "code": "INVALID_STATUS",
+                    "message": "data.status=0 is only allowed on the first audio frame",
+                    "statusCode": 400,
+                })
+                continue
+            if frame_status == 1 and not got_first:
+                await _send({
+                    "code": "INVALID_STATUS",
+                    "message": "data.status=1 requires a preceding status=0 frame",
+                    "statusCode": 400,
+                })
+                continue
+
+            if "format" in payload and payload["format"] is not None:
+                parsed_sr = _parse_l16_format(str(payload["format"]))
+                if parsed_sr is None:
+                    await _send({
+                        "code": "UNSUPPORTED_FORMAT",
+                        "message": (
+                            "format must be audio/L16;rate=16000 or audio/L16;rate=8000, "
+                            f"got {payload['format']!r}"
+                        ),
+                        "statusCode": 400,
+                    })
+                    continue
+                if got_first and parsed_sr != client_sr:
+                    await _send({
+                        "code": "UNSUPPORTED_FORMAT",
+                        "message": f"format changed mid-stream, expected {_l16_format_for_sr(client_sr)}",
+                        "statusCode": 400,
+                    })
+                    continue
+                client_sr = parsed_sr
+            elif frame_status == 0:
+                await _send({
+                    "code": "UNSUPPORTED_FORMAT",
+                    "message": "data.format is required on status=0",
+                    "statusCode": 400,
+                })
+                continue
+
+            if frame_status == 0 and "eos" in payload and payload["eos"] is not None:
+                try:
+                    eos_ms = int(payload["eos"])
+                    if eos_ms <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    await _send({
+                        "code": "INVALID_EOS",
+                        "message": "data.eos must be a positive integer (milliseconds)",
+                        "statusCode": 400,
+                    })
+                    continue
+                vad.eos_ms = eos_ms
+                log.info("WS eos_ms | session_id={} eos_ms={}", ws_req_id, eos_ms)
+
+            audio_b64 = payload.get("audio")
+            chunk = np.zeros(0, dtype=np.float32)
+            if audio_b64:
+                if not isinstance(audio_b64, str):
+                    await _send({
+                        "code": "INVALID_AUDIO",
+                        "message": "data.audio must be a base64 string",
+                        "statusCode": 400,
+                    })
+                    continue
+                try:
+                    incoming = _b64_pcm_to_bytes(audio_b64)
+                except Exception:
+                    await _send({
+                        "code": "INVALID_AUDIO",
+                        "message": "data.audio is not valid base64",
+                        "statusCode": 400,
+                    })
+                    continue
+                if client_sr != TARGET_SR:
+                    incoming = _resample_pcm_bytes(incoming, client_sr)
+                chunk = _pcm_to_float(incoming)
+            elif frame_status in (0, 1):
+                await _send({
+                    "code": "INVALID_AUDIO",
+                    "message": "data.audio is required on status=0 and status=1",
+                    "statusCode": 400,
+                })
+                continue
+
+            if frame_status in (0, 1):
+                got_first = True
+                finish = await _ingest_pcm(chunk)
+                if finish:
+                    await _finish_session(finish)
+                    break
+                continue
+
+            if chunk.size:
+                got_first = True
+                finish = await _ingest_pcm(chunk)
+                if finish:
+                    await _finish_session(finish)
+                    break
+            await _finish_session("stop")
+            break
 
     except WebSocketDisconnect:
         log.info("[WS] Client disconnected")

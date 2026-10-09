@@ -8,14 +8,14 @@ Windows 本地实时语音转写服务：[Qwen3-ASR](https://github.com/QwenLM/Q
 
 ## 功能
 
-- **WebSocket 实时转写** — `WS /realtime/stream`，原始 PCM（s16le，单声道，8 kHz 或 16 kHz）
-- **一连接一句** — 静音 EOS、客户端 `{"action":"stop"}`、或累计 16 kHz PCM 满 `WS_MAX_AUDIO_SECONDS`（≤ 60）→ `final` → `closed` → 断开
+- **WebSocket 实时转写** — `WS /realtime/stream`，JSON 信封 + base64 s16le PCM（8 kHz 或 16 kHz）
+- **一连接一句** — 客户端 `data.status=2`、静音 EOS、或累计 16 kHz PCM 满 `WS_MAX_AUDIO_SECONDS`（≤ 60）→ `final` → `closed` → 断开
 - **Partial 整段替换** — 客户端覆盖显示，不要拼接。`final` 只有 `text` / `start` / `end` / `eos_reason`，没有 `chars`
 - **服务端 VAD** — Silero：起音前静音不缓冲，pre-roll 保留约 400ms；说话后静音达到阈值结束
 - **单路并发** — 同时只允许一路 WebSocket；第二路返回 `WS_BUSY`（409）。GPU 推理单线程排队，final 可抢占 pending/inflight partial
 - **8s 窗 + encoder cache** — 长句按 8 秒切开；满窗 embedding 可复用，满窗文本可冻结后只解尾巴
 - **Final 后处理** — 中文数字 ITN、音素热词纠错（partial 不做）
-- **本机网页** — `GET /` 麦克风页：开始推流，停止发 `stop`
+- **本机网页** — `GET /` 麦克风页：开始推流，停止发 `status=2`
 - **绿色包** — `packaging/build.ps1` → `dist/ASR-REALTIME/`，托盘 `ASRRealtime.exe`
 
 ## 环境要求
@@ -89,21 +89,113 @@ python E2Etest/test_websocket_long.py
 
 ### `WS /realtime/stream`
 
-Query：
+Query 只保留 `request_id`（会话 id / 日志关联；缺省生成 UUID）。不再接受 `sample_rate`、`use_server_vad`，也不再接受二进制 PCM 或 `action` 控制帧。
 
-| 参数 | 说明 |
-|---|---|
-| `sample_rate` | `8000` 或 `16000` |
-| `use_server_vad` | 覆盖 `ASR_USE_SERVER_VAD` |
-| `request_id` | 会话 id / 日志关联；缺省生成 UUID |
+入站必须是 JSON 信封。`status`：`0` 首帧、`1` 中间、`2` 结束（可无 audio）。`format` 仅首帧必填。`eos` 可选，毫秒，未传则用 `WS_EOS_SILENCE_MS`。
 
-二进制帧 = PCM。JSON 控制：`config`（语言 / VAD）、`reset`（清缓冲、保持连接）、`stop`。
+```json
+{
+  "data": {
+    "status": 0,
+    "format": "audio/L16;rate=16000",
+    "eos": 400,
+    "audio": "base64..."
+  }
+}
+```
+
+```json
+{ "data": { "status": 2 } }
+```
 
 握手后服务端先发 `connected`，然后在说话过程中发 `type=partial`。三种结束路径等价：先 `type=final`，再 `{ "status": "closed", "reason": "..." }`，然后断开。
 
-`eos_reason` / `closed.reason`：`silence` | `stop` | `max_duration` | `disconnect`。
+`eos_reason` / `closed.reason`：`silence` | `stop`（客户端 status=2） | `max_duration` | `disconnect`。
 
-60 秒上限计的是**累计 16 kHz PCM**，不是连接墙钟。只连不送音频不会因满 60 秒断开。
+服务端 VAD 始终开启。客户端一直不发 `status=2` 时，静音达到会话 `eos` 仍会 final 并关连接。60 秒上限计的是**累计 16 kHz PCM**，不是连接墙钟。
+
+#### 返回结果
+
+出站全是 JSON。`partial` 是整段替换，不要拼接。`final` 没有 `chars`。
+
+握手成功：
+
+```json
+{
+  "status": "connected",
+  "session_id": "eval-1",
+  "sample_rate": 16000,
+  "format": "audio/L16;rate=16000",
+  "partial_seconds": 0.8,
+  "max_audio_seconds": 60.0,
+  "eos_silence_ms": 600,
+  "early_silence_ms": 1000,
+  "vad_pre_roll_ms": 400
+}
+```
+
+中间结果（可多次）：
+
+```json
+{
+  "text": "你好，这是一段测试",
+  "type": "partial"
+}
+```
+
+最终结果（三种结束路径字段相同，`eos_reason` 不同）：
+
+```json
+{
+  "text": "你好，这是一段测试。",
+  "type": "final",
+  "start": 0.12,
+  "end": 2.48,
+  "eos_reason": "stop"
+}
+```
+
+`eos_reason` 取值：
+
+| 值 | 含义 |
+|---|---|
+| `stop` | 客户端发了 `data.status=2` |
+| `silence` | 服务端 VAD 静音达到会话 `eos` |
+| `max_duration` | 累计 16 kHz PCM 达到上限 |
+| `disconnect` | 对端在会话未结束时断开 |
+
+会话结束（随后服务端关闭 WebSocket）：
+
+```json
+{
+  "status": "closed",
+  "reason": "stop"
+}
+```
+
+`closed.reason` 与上面的 `eos_reason` 相同。
+
+占用中（第二路连接，随后以 1008 关闭）：
+
+```json
+{
+  "code": "WS_BUSY",
+  "message": "Only one WebSocket transcription session is allowed",
+  "statusCode": 409
+}
+```
+
+入站校验失败（连接可继续，纠正后重发）：
+
+```json
+{
+  "code": "INVALID_STATUS",
+  "message": "data.status=1 requires a preceding status=0 frame",
+  "statusCode": 400
+}
+```
+
+其它常见 `code`：`INVALID_ENVELOPE`、`UNSUPPORTED_FORMAT`、`INVALID_AUDIO`、`INVALID_EOS`、`INVALID_JSON`、`INVALID_FRAME`。
 
 ## 配置（`.env`）
 
@@ -123,7 +215,6 @@ Query：
 | `WS_SPECULATIVE_FINAL_MS` | `300` | 投机跑 final；`0`=关 |
 | `WS_CHUNK_COMMIT_MARGIN_MS` | `400` | 满 8s 窗文本冻结边距 |
 | `WS_VAD_PRE_ROLL_MS` | `400` | 起音 pre-roll |
-| `ASR_USE_SERVER_VAD` | `true` | 可被连接 query / `config` 覆盖 |
 | `UNLOAD_GRACE_S` | `0` | `0`=模型常驻 |
 | `REALTIME_CHUNK_SIZE_SEC` | `8` | 编码器窗，不要改默认 |
 | `LOG_DIR` | `./logs` | 按天滚动 |

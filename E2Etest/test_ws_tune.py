@@ -53,6 +53,18 @@ def _assert(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def test_parse_l16_format() -> None:
+    from server import _b64_pcm_to_bytes, _l16_format_for_sr, _parse_l16_format
+    import base64
+
+    _assert(_parse_l16_format("audio/L16;rate=16000") == 16000, "16k")
+    _assert(_parse_l16_format(" audio/L16; rate=8000 ") == 8000, "8k spaces")
+    _assert(_parse_l16_format("audio/wav") is None, "reject unknown")
+    _assert(_l16_format_for_sr(8000) == "audio/L16;rate=8000", "mime 8k")
+    raw = b"\x01\x00\x02\x00"
+    _assert(_b64_pcm_to_bytes(base64.b64encode(raw).decode("ascii")) == raw, "b64")
+
+
 def test_two_tier_silence() -> None:
     sr = 16000
     early = silence_threshold_samples(int(0.2 * sr), sr, eos_ms=600, early_ms=1000, committed_s=0.8)
@@ -200,9 +212,18 @@ def test_pre_roll_unused_excludes_current_packet() -> None:
 def test_session_finish_paths() -> None:
     src = (Path(__file__).resolve().parents[1] / "src" / "server.py").read_text(encoding="utf-8")
     _assert("async def _finish_session" in src, "unified finish helper missing")
-    _assert('_finish_session("silence")' in src, "silence EOS must finish the session")
-    _assert('_finish_session("stop")' in src, "client stop must finish the session")
-    _assert('_finish_session("max_duration")' in src, "60s cap must finish the session")
+    _assert('return "silence"' in src, "silence EOS must finish the session")
+    _assert('return "max_duration"' in src, "60s cap must finish the session")
+    _assert('_finish_session("stop")' in src, "client status=2 must finish the session")
+    _assert("def _parse_l16_format" in src, "L16 format parser")
+    _assert("def _b64_pcm_to_bytes" in src, "base64 PCM decoder")
+    _assert("INVALID_STATUS" in src, "status 0/1/2 must be validated")
+    _assert("INVALID_ENVELOPE" in src, "JSON data envelope required")
+    _assert("use_server_vad" not in src, "use_server_vad must be removed")
+    _assert('action == "stop"' not in src, "action=stop must be removed")
+    _assert('action == "reset"' not in src, "action=reset must be removed")
+    _assert('action == "config"' not in src, "action=config must be removed")
+    _assert("_finish_session(finish)" in src, "ingest finish reasons must close the session")
     _assert('"eos_reason"' in src, "final must include eos_reason")
     _assert("action == \"flush\"" not in src, "flush must be removed")
     _assert('"chars"' not in src, "final must not emit chars")
@@ -352,6 +373,8 @@ def test_p3a_plus_replay_concat() -> None:
 
 
 if __name__ == "__main__":
+    test_parse_l16_format()
+    print("ok test_parse_l16_format")
     test_two_tier_silence()
     print("ok test_two_tier_silence")
     test_no_rms_fallback()

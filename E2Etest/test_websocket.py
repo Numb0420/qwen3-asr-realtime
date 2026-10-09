@@ -17,12 +17,12 @@ import soundfile as sf
 from scipy.signal import resample_poly
 import websockets
 
+from ws_envelope import FORMAT_16K, ws_audio_msg
+
 # --- 在这里改录音文件 ---
 WAV_PATH = r"C:\Users\Numb\Desktop\11s.wav"
-LANGUAGE = "auto"  # zh / en / auto
 BASE_URL = "http://127.0.0.1:8765"
 WS_URL = "ws://127.0.0.1:8765/realtime/stream"
-USE_VAD = True
 REALTIME = True
 CHUNK_MS = 200
 TARGET_SR = 16000
@@ -72,17 +72,13 @@ async def run() -> int:
 
     pcm, sr, duration = load_pcm_s16le(wav)
     chunk_bytes = max(2, int(sr * CHUNK_MS / 1000) * 2)
-    print(f"wav={wav} duration={duration:.2f}s sr={sr} bytes={len(pcm)} vad={USE_VAD}")
+    print(f"wav={wav} duration={duration:.2f}s sr={sr} bytes={len(pcm)}")
 
-    url = f"{WS_URL}?sample_rate={sr}&use_server_vad={'true' if USE_VAD else 'false'}"
-    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+    async with websockets.connect(WS_URL, max_size=None, open_timeout=10) as ws:
         hello = json.loads(await ws.recv())
         print("connected:", hello)
         if hello.get("status") != "connected":
             return 1
-
-        await ws.send(json.dumps({"action": "config", "language": LANGUAGE, "use_server_vad": USE_VAD}))
-        print("configured:", json.loads(await ws.recv()))
 
         finals: list[str] = []
         got_closed = asyncio.Event()
@@ -106,12 +102,16 @@ async def run() -> int:
         reader_task = asyncio.create_task(reader())
         try:
             offset = 0
+            first = True
             while offset < len(pcm):
-                await ws.send(pcm[offset : offset + chunk_bytes])
+                piece = pcm[offset : offset + chunk_bytes]
+                status = 0 if first else 1
+                await ws.send(ws_audio_msg(status, piece, FORMAT_16K))
+                first = False
                 offset += chunk_bytes
                 if REALTIME:
                     await asyncio.sleep(CHUNK_MS / 1000.0)
-            await ws.send(json.dumps({"action": "stop"}))
+            await ws.send(ws_audio_msg(2))
             await asyncio.wait_for(got_closed.wait(), timeout=120.0)
         except asyncio.TimeoutError:
             print("timeout waiting for stop/closed", file=sys.stderr)

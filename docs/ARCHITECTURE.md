@@ -19,7 +19,7 @@ Windows 本地 FastAPI 服务：一次 WebSocket 连接对应一句语音。编�
 | `vendor/qwen_asr_gguf/` | 8s 分窗 ASR、P3-A / P3-A+ cache |
 | `src/itn.py` / `src/hotword_correct.py` | 仅 final 后处理 |
 | `src/logger.py` / `src/paths.py` | `LOG_DIR` 解析；按天滚动文件 |
-| `web/index.html` | 麦克风页：推 PCM，停止发 `{"action":"stop"}` |
+| `web/index.html` | 麦克风页：推 JSON 信封，停止发 `{data:{status:2}}` |
 | `E2Etest/` | 协议/队列单测 + Excel 批量评测 |
 | `packaging/` | 绿色包：`ASRRealtime.spec` + `build.ps1` |
 
@@ -49,10 +49,10 @@ Windows 本地 FastAPI 服务：一次 WebSocket 连接对应一句语音。编�
 connected → listening → closing → idle → {status:closed} → 断开
 ```
 
-- 输入：16-bit LE PCM，单声道，8 kHz 或 16 kHz（内部升到 16 kHz）。8 kHz 会过电话频带滤波。
+- 输入：JSON `{ "data": { status, format, eos?, audio } }`。`audio` 为 base64 s16le PCM，8 kHz 或 16 kHz（内部升到 16 kHz）。8 kHz 会过电话频带滤波。
 - 一连接一句。partial **替换**全文，客户端不要拼接。
-- 三种等价结束：静音 EOS、客户端 `stop`、累计 16 kHz PCM ≥ `WS_MAX_AUDIO_SECONDS`（上限 60）。都是 final → `closed` → 断开。
-- 控制 JSON：`config`（语言 / VAD）、`reset`（清缓冲、保持连接）、`stop`。
+- 三种等价结束：静音 EOS、客户端 `data.status=2`（`eos_reason=stop`）、累计 16 kHz PCM ≥ `WS_MAX_AUDIO_SECONDS`（上限 60）。都是 final → `closed` → 断开。
+- 不接受二进制 PCM，也不接受 `action=stop/reset/config`。服务端 VAD 始终开启；`eos` 只在首帧生效。
 
 ### 握手（服务端 → 客户端）
 
@@ -61,13 +61,12 @@ connected → listening → closing → idle → {status:closed} → 断开
   "status": "connected",
   "session_id": "...",
   "sample_rate": 16000,
-  "format": "pcm_s16le",
+  "format": "audio/L16;rate=16000",
   "partial_seconds": 0.8,
   "max_audio_seconds": 60.0,
   "eos_silence_ms": 600,
   "early_silence_ms": 1000,
-  "vad_pre_roll_ms": 400,
-  "use_server_vad": true
+  "vad_pre_roll_ms": 400
 }
 ```
 
@@ -85,9 +84,15 @@ connected → listening → closing → idle → {status:closed} → 断开
 
 ### Query
 
-- `sample_rate`：8000 或 16000
-- `use_server_vad`：覆盖 `ASR_USE_SERVER_VAD`
 - `request_id`：会话 id / 日志关联键
+
+### 入站信封
+
+```json
+{ "data": { "status": 0, "format": "audio/L16;rate=16000", "eos": 400, "audio": "..." } }
+```
+
+`status`：`0` 首帧（必带 `format`）、`1` 中间、`2` 结束（可无 audio）。`eos` 可选，默认 `WS_EOS_SILENCE_MS`。
 
 ## 5. listening 主循环
 
@@ -95,14 +100,12 @@ connected → listening → closing → idle → {status:closed} → 断开
 2. VAD 判定说话后，PCM 累加进 `speech_buf`（growing buffer）。
 3. 缓冲每增加约 `WS_PARTIAL_SECONDS`（代码默认 1.5s，当前 `.env` 常为 0.8s），且未进入投机静音区间，enqueue **partial**。
 4. 已 committed（约 0.8s 语音）后，静音 ≥ `WS_SPECULATIVE_FINAL_MS`（300ms）时跑 **speculative final**（不进入 CLOSING）。再开口则 cancel。真正 EOS 仍是 `WS_EOS_SILENCE_MS`（600ms）。短句未 committed 时要用更长静音：`WS_EARLY_SILENCE_MS`（1000ms）。
-5. EOS / stop / 满时长 → `_finish_session`：
+5. EOS / status=2 / 满时长 → `_finish_session`：
    - `session_phase = closing`，不再收 PCM、不再 spawn partial
    - `infer_queue.close_session`
    - `_emit_final`（若投机任务已在跑则等待复用，否则提交 `kind=final`）
    - 释放 `_active_ws`（须在嵌套函数里 `global _active_ws`）
    - 发送 `closed` 并 `websocket.close()`
-
-`reset`：清空 `speech_buf` / pre-roll / VAD / encoder cache，保持连接。
 
 ## 6. 推理队列
 
@@ -148,7 +151,7 @@ final 文本顺序：ASR → 中文 ITN → 热词。partial 不做这两步。
 | `WS_SPECULATIVE_FINAL_MS` | 300 | 投机 final；0=关 |
 | `WS_CHUNK_COMMIT_MARGIN_MS` | 400 | A+ 冻结边距 |
 | `WS_VAD_PRE_ROLL_MS` | 400 | onset pre-roll |
-| `ASR_USE_SERVER_VAD` | true | 可被连接 query / config 覆盖 |
+| `ASR_USE_SERVER_VAD` | true | 已不再覆盖 WS；服务端 VAD 始终开启 |
 | `UNLOAD_GRACE_S` | 0 | 0=常驻不卸 |
 | `REALTIME_CHUNK_SIZE_SEC` | 8 | 编码器窗；不要改默认 |
 | `LOG_DIR` | `./logs` | 所有日志目录 |
@@ -163,10 +166,10 @@ sequenceDiagram
     participant Q as InferQueue
     participant E as ONNX+GGUF
 
-    C->>S: WS connect PCM
+    C->>S: WS connect
     S-->>C: connected
     loop listening
-        C->>S: pcm chunk
+        C->>S: data status 0 or 1
         S->>S: VAD + pre-roll + speech_buf
         S->>Q: partial (prio 1)
         Q->>E: asr growing-buffer

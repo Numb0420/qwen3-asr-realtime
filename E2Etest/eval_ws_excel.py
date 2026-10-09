@@ -33,6 +33,10 @@ from scipy.signal import resample_poly
 import websockets
 
 ROOT = Path(__file__).resolve().parents[1]
+_E2E = Path(__file__).resolve().parent
+if str(_E2E) not in sys.path:
+    sys.path.insert(0, str(_E2E))
+from ws_envelope import FORMAT_16K, ws_audio_msg
 AUDIO_DIR = Path(r"E:\cursorProject\tts_ws_python3_demo\audio")
 XLSX_NAME = "tts-50.xlsx"
 BASE_URL = "http://127.0.0.1:8765"
@@ -226,13 +230,9 @@ def release_eval_lock(fd: int) -> None:
         pass
 
 
-async def connect_session(session_id: str, use_vad: bool, busy_wait_s: float):
+async def connect_session(session_id: str, busy_wait_s: float):
     """Retry while the server still holds the previous WebSocket (WS_BUSY)."""
-    url = (
-        f"{WS_URL}?sample_rate={TARGET_SR}"
-        f"&use_server_vad={'true' if use_vad else 'false'}"
-        f"&request_id={session_id}"
-    )
+    url = f"{WS_URL}?request_id={session_id}"
     deadline = time.perf_counter() + max(0.5, busy_wait_s)
     last = None
     while time.perf_counter() < deadline:
@@ -259,7 +259,6 @@ async def transcribe_one(
     realtime: bool,
     chunk_ms: int,
     language: str,
-    use_vad: bool,
     timeout_s: float,
     busy_wait_s: float = 20.0,
 ) -> dict:
@@ -274,12 +273,9 @@ async def transcribe_one(
     n_partial = 0
     hello_sid = session_id
 
-    ws, hello = await connect_session(session_id, use_vad, busy_wait_s)
+    ws, hello = await connect_session(session_id, busy_wait_s)
     hello_sid = str(hello.get("session_id") or session_id)
     try:
-        await ws.send(json.dumps({"action": "config", "language": language, "use_server_vad": use_vad}))
-        await ws.recv()
-
         closed = asyncio.Event()
 
         async def reader():
@@ -310,18 +306,21 @@ async def transcribe_one(
         task = asyncio.create_task(reader())
         try:
             offset = 0
+            first = True
             while offset < len(pcm) and not closed.is_set():
+                piece = pcm[offset : offset + chunk]
                 try:
-                    await ws.send(pcm[offset : offset + chunk])
+                    await ws.send(ws_audio_msg(0 if first else 1, piece, FORMAT_16K))
                 except websockets.ConnectionClosed:
                     break
+                first = False
                 t_last_send = time.perf_counter()
                 offset += chunk
                 if realtime:
                     await asyncio.sleep(chunk_ms / 1000.0)
             if not closed.is_set():
                 try:
-                    await ws.send(json.dumps({"action": "stop"}))
+                    await ws.send(ws_audio_msg(2))
                 except websockets.ConnectionClosed:
                     pass
             await asyncio.wait_for(closed.wait(), timeout=timeout_s)
@@ -429,7 +428,7 @@ def main() -> int:
     ap.add_argument("--to", dest="seq_to", type=int, default=50)
     ap.add_argument("--fast", action="store_true", help="send PCM as fast as possible (accuracy only)")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--no-vad", action="store_true")
+    ap.add_argument("--no-vad", action="store_true", help="ignored; server VAD is always on")
     args = ap.parse_args()
     if args.log is None:
         args.log = resolve_server_log()
@@ -475,7 +474,8 @@ def main() -> int:
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         results: list[dict] = []
-        use_vad = not args.no_vad
+        if args.no_vad:
+            print("--no-vad is ignored; server VAD is always on")
         for seq, ref in items:
             wav = find_wav(folder, seq)
             rec = {k: "" for k in CSV_FIELDS}
@@ -497,7 +497,6 @@ def main() -> int:
                         realtime=not args.fast,
                         chunk_ms=200,
                         language=args.language,
-                        use_vad=use_vad,
                         timeout_s=180.0,
                     )
                 )

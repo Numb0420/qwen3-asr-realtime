@@ -38,9 +38,10 @@ Local real-time speech-to-text using Qwen3-ASR (ONNX Encoder + GGUF Decoder).
 
 ## Features
 - Single-connection WebSocket `/realtime/stream`
-- One session, one utterance: silence EOS, client `stop`, or 60s max → final then close
+- One session, one utterance: client `data.status=2`, silence EOS, or 60s max → final then close
 - Windows local runtime (DirectML + Vulkan), no Docker / PyTorch
 
 ## Audio
-WebSocket PCM: 16-bit little-endian, 8 kHz or 16 kHz, mono. Max 60 seconds.
+Inbound JSON envelope `{ "data": { "status", "format", "eos?", "audio" } }`.
+`format` is `audio/L16;rate=16000` or `audio/L16;rate=8000`. `audio` is base64 s16le PCM.
 """

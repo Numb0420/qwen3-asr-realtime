@@ -65,7 +65,7 @@ python E2Etest/test_websocket_long.py
 | `/health` | GET | Health check, model status, EOS/max-audio config |
 | `/admin/warmup` | POST | Load the ASR model |
 | `/admin/shutdown` | POST | Stop the server |
-| `/realtime/stream` | WebSocket | Real-time streaming with raw PCM input |
+| `/realtime/stream` | WebSocket | Real-time streaming; JSON `{data:{status,format,audio}}` |
 
 ### Concurrency Model
 
@@ -82,14 +82,15 @@ python E2Etest/test_websocket_long.py
 
 ### WebSocket Real-Time Transcription (`/realtime/stream`)
 
-- Accepts raw PCM: 16-bit little-endian, 8 kHz or 16 kHz, mono
+- Accepts JSON `{ "data": { "status", "format", "eos?", "audio" } }`. `audio` is base64 s16le PCM (8 kHz or 16 kHz)
+- `status`: `0` first frame (`format` required), `1` middle, `2` last (ends session; audio optional)
 - One connection = one utterance. Partials are cumulative (client replaces, never appends)
 - Final has **no `chars`**. Payload: `{text, type, start, end, eos_reason}`
 - Three equivalent end paths, all `final` then `{status:"closed", reason}` then disconnect:
-  - **silence EOS**: backend endpoint, silence ≥ `WS_EOS_SILENCE_MS` after speech
-  - **stop**: client JSON `{"action":"stop"}`
+  - **silence EOS**: backend endpoint, silence ≥ session `eos` (default `WS_EOS_SILENCE_MS`)
+  - **stop**: client `{ "data": { "status": 2 } }`
   - **max_duration**: accumulated 16 kHz PCM ≥ `WS_MAX_AUDIO_SECONDS` (max 60)
-- Control messages: `reset` (clear buffer, stay connected), `config` (language / VAD), `stop`
+- No binary PCM, no `action` / `use_server_vad`. Server VAD is always on
 - VAD skip: silent frames before first speech are not buffered; pre-roll keeps ~400ms of onset
 
 ## Key Environment Variables
@@ -101,7 +102,7 @@ python E2Etest/test_websocket_long.py
 | `WS_EARLY_SILENCE_MS` | `1000` | Longer silence required before ~0.8s of speech |
 | `WS_PARTIAL_SECONDS` | `1.5` | Partial emit interval |
 | `WS_VAD_PRE_ROLL_MS` | `400` | Onset pre-roll |
-| `ASR_USE_SERVER_VAD` | `true` | Server-side VAD / EOS (overridable per-connection) |
+| `ASR_USE_SERVER_VAD` | `true` | Unused for WS; server VAD is always on |
 | `UNLOAD_GRACE_S` | `0` | Seconds before model unloads (0 = keep loaded) |
 | `REQUEST_TIMEOUT` | `300` | Max inference time per request |
 | `REALTIME_CHUNK_SIZE_SEC` | `8` | Encoder window; 60s audio is split internally |

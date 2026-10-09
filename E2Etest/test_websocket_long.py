@@ -17,14 +17,15 @@ import soundfile as sf
 from scipy.signal import resample_poly
 import websockets
 
+from ws_envelope import FORMAT_16K, ws_audio_msg
+
 WAV_PATH = r"C:\Users\Numb\Desktop\11s.wav"
-LANGUAGE = "auto"
 BASE_URL = "http://127.0.0.1:8765"
 WS_URL = "ws://127.0.0.1:8765/realtime/stream"
 CHUNK_MS = 200
 TARGET_SR = 16000
-# Server VAD off so looping speech is not cut by in-file silence before 60s.
-USE_VAD = False
+# Long silence so in-file pauses do not EOS before the 60s PCM cap.
+LOOP_EOS_MS = 600000
 
 
 def load_pcm_s16le(path: Path) -> tuple[bytes, int, float]:
@@ -61,20 +62,16 @@ async def run() -> int:
 
     pcm, sr, duration = load_pcm_s16le(wav)
     chunk_bytes = max(2, int(sr * CHUNK_MS / 1000) * 2)
-    print(f"wav={wav} duration={duration:.2f}s loop until {cap:.1f}s vad={USE_VAD}")
+    print(f"wav={wav} duration={duration:.2f}s loop until {cap:.1f}s eos_ms={LOOP_EOS_MS}")
 
-    url = f"{WS_URL}?sample_rate={sr}&use_server_vad={'true' if USE_VAD else 'false'}"
     finals: list[dict] = []
     closed: dict | None = None
 
-    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+    async with websockets.connect(WS_URL, max_size=None, open_timeout=10) as ws:
         hello = json.loads(await ws.recv())
         print("connected:", hello)
         if hello.get("status") != "connected":
             return 1
-
-        await ws.send(json.dumps({"action": "config", "language": LANGUAGE, "use_server_vad": USE_VAD}))
-        print("configured:", json.loads(await ws.recv()))
 
         got_closed = asyncio.Event()
 
@@ -98,11 +95,17 @@ async def run() -> int:
         reader_task = asyncio.create_task(reader())
         try:
             sent = 0
+            first = True
             target = int(cap * sr) * 2  # bytes at 16-bit
             while sent < target and not got_closed.is_set():
                 offset = sent % len(pcm)
                 take = min(chunk_bytes, len(pcm) - offset)
-                await ws.send(pcm[offset : offset + take])
+                piece = pcm[offset : offset + take]
+                if first:
+                    await ws.send(ws_audio_msg(0, piece, FORMAT_16K, eos=LOOP_EOS_MS))
+                    first = False
+                else:
+                    await ws.send(ws_audio_msg(1, piece, FORMAT_16K))
                 sent += take
                 await asyncio.sleep(CHUNK_MS / 1000.0)
             await asyncio.wait_for(got_closed.wait(), timeout=120.0)
