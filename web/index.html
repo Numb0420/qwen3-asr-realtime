@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>实时语音转写</title>
+  <style>
+    :root {
+      --bg: #121418;
+      --panel: #1c2028;
+      --line: #2c3340;
+      --text: #e8eaed;
+      --muted: #8b93a3;
+      --accent: #3dd6c6;
+      --stop: #e85d5d;
+      --start: #3dd6c6;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: min(720px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 28px 28px 24px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      font-weight: 600;
+    }
+    .hint {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 22px;
+      font-size: 15px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #btn-start { background: var(--start); color: #10221f; }
+    #btn-stop { background: var(--stop); color: #fff; }
+    #status {
+      margin-left: auto;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    #status.live { color: var(--accent); }
+    #status.err { color: var(--stop); }
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      resize: vertical;
+      background: #101318;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 16px;
+      line-height: 1.6;
+      outline: none;
+    }
+    textarea::placeholder { color: #5c6573; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>实时语音转写</h1>
+    <p class="hint">点开始采集麦克风并推流；点停止发送 stop。静音超时或满 60 秒也会自动结束。</p>
+    <div class="row">
+      <button id="btn-start" type="button">开始</button>
+      <button id="btn-stop" type="button" disabled>停止</button>
+      <span id="status">未开始</span>
+    </div>
+    <textarea id="text" readonly placeholder="识别文本会显示在这里"></textarea>
+  </div>
+  <script>
+    const TARGET_SR = 16000;
+    const statusEl = document.getElementById("status");
+    const textEl = document.getElementById("text");
+    const btnStart = document.getElementById("btn-start");
+    const btnStop = document.getElementById("btn-stop");
+
+    let ws = null;
+    let stream = null;
+    let audioCtx = null;
+    let processor = null;
+    let source = null;
+    let sending = false;
+    let livePartial = "";
+
+    function setStatus(msg, kind) {
+      statusEl.textContent = msg;
+      statusEl.className = kind || "";
+    }
+
+    function setRecording(on) {
+      btnStart.disabled = on;
+      btnStop.disabled = !on;
+    }
+
+    function downsample(input, inRate, outRate, carry) {
+      if (inRate === outRate) {
+        return { samples: input, carry: new Float32Array(0) };
+      }
+      const merged = new Float32Array(carry.length + input.length);
+      merged.set(carry, 0);
+      merged.set(input, carry.length);
+      const ratio = inRate / outRate;
+      const outLen = Math.floor(merged.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const i0 = Math.floor(pos);
+        const i1 = Math.min(i0 + 1, merged.length - 1);
+        const f = pos - i0;
+        out[i] = merged[i0] * (1 - f) + merged[i1] * f;
+      }
+      const used = Math.floor(outLen * ratio);
+      return { samples: out, carry: merged.slice(used) };
+    }
+
+    function floatToPcm16(float32) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        let s = float32[i];
+        if (s > 1) s = 1;
+        else if (s < -1) s = -1;
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      return `${proto}//${location.host}/realtime/stream?sample_rate=${TARGET_SR}&use_server_vad=true`;
+    }
+
+    async function stopCapture() {
+      sending = false;
+      if (processor) {
+        processor.onaudioprocess = null;
+        try { processor.disconnect(); } catch (_) {}
+        processor = null;
+      }
+      if (source) {
+        try { source.disconnect(); } catch (_) {}
+        source = null;
+      }
+      if (audioCtx) {
+        try { await audioCtx.close(); } catch (_) {}
+        audioCtx = null;
+      }
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop();
+        stream = null;
+      }
+    }
+
+    function handleMessage(msg) {
+      if (msg.type === "partial") {
+        livePartial = msg.text || "";
+        textEl.value = livePartial;
+        return;
+      }
+      if (msg.type === "final") {
+        const t = msg.text || "";
+        textEl.value = t;
+        livePartial = t;
+        return;
+      }
+      if (msg.status === "closed") {
+        const reason = msg.reason || "closed";
+        const label = {
+          stop: "已停止",
+          silence: "静音结束",
+          max_duration: "已达 60 秒上限",
+          disconnect: "连接断开",
+        }[reason] || ("已结束：" + reason);
+        setStatus(label);
+        setRecording(false);
+        stopCapture();
+        return;
+      }
+      if (msg.code) {
+        setStatus(msg.message || msg.code, "err");
+        setRecording(false);
+        stopCapture();
+      }
+    }
+
+    function bindSocket(sock) {
+      sock.onerror = () => {
+        setStatus("WebSocket 连接失败", "err");
+        setRecording(false);
+        stopCapture();
+      };
+      sock.onclose = () => {
+        if (sending) {
+          setStatus("连接已关闭");
+          setRecording(false);
+          stopCapture();
+        }
+        if (ws === sock) ws = null;
+      };
+      sock.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        handleMessage(msg);
+      };
+    }
+
+    async function start() {
+      if (sending) return;
+      livePartial = "";
+      textEl.value = "";
+      setStatus("请求麦克风…");
+      setRecording(true);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+      } catch (err) {
+        setStatus("无法打开麦克风：" + (err.message || err), "err");
+        setRecording(false);
+        return;
+      }
+
+      setStatus("连接识别服务…");
+      const sock = new WebSocket(wsUrl());
+      sock.binaryType = "arraybuffer";
+      ws = sock;
+
+      try {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("连接超时")), 15000);
+          sock.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error("WebSocket 连接失败"));
+          };
+          sock.onmessage = (ev) => {
+            let msg;
+            try { msg = JSON.parse(ev.data); } catch (_) { return; }
+            clearTimeout(timer);
+            if (msg.status === "connected") {
+              resolve(msg);
+              return;
+            }
+            reject(new Error(msg.message || msg.code || "握手失败"));
+          };
+        });
+      } catch (err) {
+        setStatus(String(err.message || err), "err");
+        setRecording(false);
+        await stopCapture();
+        try { sock.close(); } catch (_) {}
+        if (ws === sock) ws = null;
+        return;
+      }
+
+      bindSocket(sock);
+      audioCtx = new AudioContext();
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      source = audioCtx.createMediaStreamSource(stream);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      let carry = new Float32Array(0);
+      sending = true;
+      processor.onaudioprocess = (e) => {
+        if (!sending || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const { samples, carry: next } = downsample(
+          input,
+          audioCtx.sampleRate,
+          TARGET_SR,
+          carry
+        );
+        carry = next;
+        if (!samples.length) return;
+        ws.send(floatToPcm16(samples).buffer);
+      };
+      const mute = audioCtx.createGain();
+      mute.gain.value = 0;
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(audioCtx.destination);
+      setStatus("录音中", "live");
+    }
+
+    async function stop() {
+      if (!ws && !sending) return;
+      sending = false;
+      btnStop.disabled = true;
+      setStatus("正在结束…");
+      await stopCapture();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ action: "stop" }));
+        } catch (_) {}
+      } else {
+        setRecording(false);
+        setStatus("已停止");
+      }
+    }
+
+    btnStart.addEventListener("click", () => {
+      start().catch((err) => {
+        setStatus(String(err.message || err), "err");
+        setRecording(false);
+      });
+    });
+    btnStop.addEventListener("click", () => { stop(); });
+  </script>
+</body>
+</html>

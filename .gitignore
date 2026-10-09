@@ -1,0 +1,14 @@
+models/
+vendor/qwen_asr_gguf/inference/bin/*.dll
+build.log
+*.wav
+*.mp3
+*.flac
+test.txt
+__pycache__/
+*.pyc
+.claude/
+.worktrees/
+outputs/
+dist/
+logs/
