@@ -1,291 +1,173 @@
-# Qwen3-ASR Realtime Server
+# Qwen3-ASR Realtime
 
-> 当前支持的本地运行方式：`conda activate lingting` 后执行 `python run.py`。
+Windows 本地实时语音转写服务：[Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) 的 **ONNX Encoder（DirectML）+ GGUF Decoder（llama.cpp / Vulkan）**。
 
-Windows-local FastAPI server for [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)：ONNX Encoder (DirectML) + GGUF Decoder (Vulkan)。**只提供实时 WebSocket**，一次连接转一段音频。
+只提供实时 WebSocket。一次连接转一句，没有离线 HTTP 转写，也没有 Docker / PyTorch 运行时。
 
-## Features
+仓库：<https://github.com/Numb0420/qwen3-asr-realtime>
 
-### Speech-to-Text
-- **Real-time WebSocket** — `WS /realtime/stream` accepts raw PCM for live transcription
-- **One session, one utterance** — silence EOS, client `stop`, or 60s max → `final` then close
-- **Multi-language** — auto-detects English, Chinese, Japanese, Cantonese, Hindi, Thai, and more
+## 功能
 
-### Real-Time WebSocket
-- **Backend endpoint (EOS)** — Silero VAD: silence ≥ `WS_EOS_SILENCE_MS` after speech ends the audio
-- **Max 60 seconds** — accumulated 16 kHz PCM then `final` (`eos_reason=max_duration`) and disconnect
-- **Client stop** — `{"action":"stop"}` also ends the session
-- **Partials** — cumulative; client replaces, never appends. Final has **no `chars`**
-- **Control commands** — `reset`, `config` (language, VAD), `stop`
+- **WebSocket 实时转写** — `WS /realtime/stream`，原始 PCM（s16le，单声道，8 kHz 或 16 kHz）
+- **一连接一句** — 静音 EOS、客户端 `{"action":"stop"}`、或累计 16 kHz PCM 满 `WS_MAX_AUDIO_SECONDS`（≤ 60）→ `final` → `closed` → 断开
+- **Partial 整段替换** — 客户端覆盖显示，不要拼接。`final` 只有 `text` / `start` / `end` / `eos_reason`，没有 `chars`
+- **服务端 VAD** — Silero：起音前静音不缓冲，pre-roll 保留约 400ms；说话后静音达到阈值结束
+- **单路并发** — 同时只允许一路 WebSocket；第二路返回 `WS_BUSY`（409）。GPU 推理单线程排队，final 可抢占 pending/inflight partial
+- **8s 窗 + encoder cache** — 长句按 8 秒切开；满窗 embedding 可复用，满窗文本可冻结后只解尾巴
+- **Final 后处理** — 中文数字 ITN、音素热词纠错（partial 不做）
+- **本机网页** — `GET /` 麦克风页：开始推流，停止发 `stop`
+- **绿色包** — `packaging/build.ps1` → `dist/ASR-REALTIME/`，托盘 `ASRRealtime.exe`
 
-### Performance
-- **Priority scheduling** — WebSocket requests (priority 0) preempt HTTP uploads (priority 1) via min-heap queue
-- **On-demand model loading** — model loads on first request, unloads after idle timeout (0 VRAM when idle)
-- **Gateway + Worker mode** — proxy + subprocess split; killing worker reclaims all RAM/VRAM
-- **Flash Attention 2** with graceful SDPA fallback
-- **Pinned memory + CUDA stream** — async DMA pipeline for transfer/compute overlap
+## 环境要求
 
-### Quantization & Acceleration (opt-in)
-- **INT8 W8A8** via bitsandbytes (`QUANTIZE=int8`) — ~50% VRAM reduction
-- **FP8** via torchao (`QUANTIZE=fp8`) — requires sm_89+ (Hopper/Ada Lovelace)
-- **ONNX Runtime encoder** (`ONNX_ENCODER_PATH`) — ORT-accelerated encoder
-- **TensorRT encoder** (`TRT_ENCODER_PATH`) — compiled TRT engine
-- **CUDA Graphs warming** (`USE_CUDA_GRAPHS=true`) — kernel caching warmup passes
-- **Speculative decoding** (`USE_SPECULATIVE=true`) — 0.6B draft + 1.7B verifier
+- Windows + 支持 DirectML 的 GPU（解码走 Vulkan）
+- conda 环境 **`lingting`**（Python 3.10），不要用 `base`
+- 模型放到 `MODEL_DIR`（默认 `./models/`）：
+  - `qwen3_asr_llm.q5_k.gguf`
+  - `qwen3_asr_encoder_frontend.int8.onnx`
+  - `qwen3_asr_encoder_backend.int8.onnx`
+  - `silero_vad.onnx`
+- llama.cpp Windows Vulkan DLL 放到 `vendor/qwen_asr_gguf/inference/bin/`（版本见 [`vendor/VENDOR.md`](vendor/VENDOR.md)）
 
-### Observability
-- **Structured logging** — loguru-based with configurable `LOG_LEVEL`
-- **Request tracing** — `X-Request-ID` header propagated through gateway→worker→server
-- **Atomic request logging** — every endpoint logs entry (params, size) and exit (duration, result)
-- **Swagger UI** — interactive API docs at `/docs` with typed Pydantic schemas
+不加载 ForcedAligner。
 
-## Quick Start
+## 快速开始
 
-```bash
-# Clone and start
-git clone https://github.com/jaaacki/qwen3-asr.git
-cd qwen3-asr
-cp .env.example .env   # Adjust settings as needed
-docker compose up -d
-
-# Check health
-curl http://localhost:8100/health
-
-# Transcribe audio file
-curl -X POST http://localhost:8100/v1/audio/transcriptions \
-  -F "file=@audio.wav"
-
-# Streaming transcription (SSE)
-curl -X POST http://localhost:8100/v1/audio/transcriptions/stream \
-  -F "file=@audio.wav" -N
-
-# Generate subtitles
-curl -X POST http://localhost:8100/v1/audio/subtitles \
-  -F "file=@audio.wav" -F "mode=fast" -o subtitles.srt
+```powershell
+conda activate lingting
+pip install -r requirements.txt
+# 按本机路径改 .env（HOST / PORT / MODEL_DIR / HOTWORDS_PATH）
+python run.py
 ```
 
-For WebSocket real-time transcription, see [docs/WEBSOCKET_USAGE.md](docs/WEBSOCKET_USAGE.md).
+默认代码监听 `127.0.0.1:8765`。仓库里的 `.env` 当前是 `0.0.0.0:8766`，以 `.env` 为准。
 
-## Requirements
+```powershell
+curl http://127.0.0.1:8766/health
+```
 
-- Docker with NVIDIA GPU support (`nvidia-docker2` or Docker 19.03+)
-- NVIDIA GPU with CUDA 12.4 compatible driver
-- ~4GB disk for model download (cached in `./models/`)
-- ~3.5GB VRAM for ASR-1.7B model at runtime
+浏览器打开同一地址的 `/` 即可用麦克风试转写。
 
-## API Endpoints
+手工客户端（服务已启动，脚本顶部设 `WAV_PATH`）：
+
+```powershell
+conda activate lingting
+python E2Etest/test_ws_tune.py
+python E2Etest/test_websocket.py
+python E2Etest/test_websocket_long.py
+```
+
+## 接口
+
+| 接口 | 方法 | 说明 |
+|---|---|---|
+| `/` | GET | 麦克风测试页 |
+| `/health` | GET | 模型状态、EOS / 最大时长 |
+| `/admin/warmup` | POST | 加载模型 |
+| `/admin/shutdown` | POST | 停止进程 |
+| `/realtime/stream` | WebSocket | 实时转写 |
+| `/docs` | GET | Swagger |
+
+没有 `/v1/audio/transcriptions`、SSE、字幕接口。
 
 ### `GET /health`
-
-Returns server status, model info, and GPU memory.
 
 ```json
 {
   "status": "ok",
   "model_loaded": true,
-  "model_id": "Qwen/Qwen3-ASR-1.7B",
-  "cuda": true,
-  "gpu_name": "NVIDIA GeForce RTX 4060",
-  "gpu_allocated_mb": 3584,
-  "gpu_reserved_mb": 3712
+  "backend": "gguf",
+  "state": "ready",
+  "model_id": "qwen3_asr_llm.q5_k.gguf",
+  "onnx_provider": "DML",
+  "llm_gpu": "vulkan",
+  "format_num": true,
+  "max_audio_seconds": 60.0,
+  "eos_silence_ms": 600
 }
-```
-
-### `POST /v1/audio/transcriptions`
-
-Transcribe an audio file. OpenAI-compatible.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `file` | file | required | Audio file (WAV, MP3, FLAC, OGG, AIFF, etc.) |
-| `language` | string | `"auto"` | Language code (e.g. `en`, `zh`, `ja`) or `"auto"` |
-| `return_timestamps` | bool | `false` | Include word-level timestamps |
-
-```bash
-curl -X POST http://localhost:8100/v1/audio/transcriptions \
-  -F "file=@recording.wav" \
-  -F "language=en" \
-  -F "return_timestamps=true"
-```
-
-Response:
-```json
-{"text": "Hello world.", "language": "en"}
-```
-
-### `POST /v1/audio/transcriptions/stream`
-
-Same parameters as transcription. Returns chunked SSE stream. Long audio (>5s) is split for progressive output.
-
-```bash
-curl -X POST http://localhost:8100/v1/audio/transcriptions/stream \
-  -F "file=@recording.wav" -N
-```
-
-Each SSE event:
-```
-data: {"text": "Hello", "language": "en", "is_final": false, "chunk_index": 0}
-data: {"text": "world.", "language": "en", "is_final": true, "chunk_index": 1}
-data: {"done": true}
-```
-
-### `POST /v1/audio/subtitles`
-
-Generate SRT subtitle file from audio.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `file` | file | required | Audio file |
-| `language` | string | `"auto"` | Language code or `"auto"` |
-| `mode` | string | `"accurate"` | `"accurate"` (ForcedAligner) or `"fast"` (heuristic) |
-| `max_line_chars` | int | `42` | Maximum characters per subtitle line |
-
-```bash
-# Fast mode — no aligner needed, works on any GPU
-curl -X POST http://localhost:8100/v1/audio/subtitles \
-  -F "file=@recording.wav" \
-  -F "mode=fast" \
-  -o subtitles.srt
-
-# Accurate mode — loads ForcedAligner (~5.8GB VRAM, needs >8GB GPU)
-curl -X POST http://localhost:8100/v1/audio/subtitles \
-  -F "file=@recording.wav" \
-  -F "mode=accurate" \
-  -o subtitles.srt
-```
-
-Output is standard `.srt` format:
-```srt
-1
-00:00:00,000 --> 00:00:02,340
-Hello, this is a test recording.
-
-2
-00:00:02,500 --> 00:00:05,120
-The subtitles are generated automatically.
 ```
 
 ### `WS /realtime/stream`
 
-Real-time WebSocket transcription. Accepts raw PCM 16-bit LE, 8 kHz or 16 kHz mono. Max 60 seconds.
+Query：
 
-| Query Parameter | Default | Description |
-|-----------------|---------|-------------|
-| `use_server_vad` | `true` | Enable server-side VAD (EOS on silence, skip leading silence) |
+| 参数 | 说明 |
+|---|---|
+| `sample_rate` | `8000` 或 `16000` |
+| `use_server_vad` | 覆盖 `ASR_USE_SERVER_VAD` |
+| `request_id` | 会话 id / 日志关联；缺省生成 UUID |
 
-One connection = one utterance. End paths: silence EOS, `{"action":"stop"}`, or 60s cap. Final payload has `text` / `start` / `end` / `eos_reason`, no `chars`.
+二进制帧 = PCM。JSON 控制：`config`（语言 / VAD）、`reset`（清缓冲、保持连接）、`stop`。
 
-### `GET /docs`
+握手后服务端先发 `connected`，然后在说话过程中发 `type=partial`。三种结束路径等价：先 `type=final`，再 `{ "status": "closed", "reason": "..." }`，然后断开。
 
-Interactive Swagger UI with all endpoints and Pydantic request/response schemas.
+`eos_reason` / `closed.reason`：`silence` | `stop` | `max_duration` | `disconnect`。
 
-## Configuration
+60 秒上限计的是**累计 16 kHz PCM**，不是连接墙钟。只连不送音频不会因满 60 秒断开。
 
-All settings are configured via environment variables in `.env`. See [`.env.example`](.env.example) for a documented template.
+## 配置（`.env`）
 
-### Core
+`run.py` 启动时读取根目录 `.env`。代码默认与当前仓库 `.env` 不一致时，以 `.env` 为准。
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8100` | Host port mapped to container port 8000 |
-| `MODEL_ID` | `Qwen/Qwen3-ASR-1.7B` | HuggingFace model ID (`Qwen/Qwen3-ASR-0.6B` for speed) |
-| `IDLE_TIMEOUT` | `120` | Seconds before unloading model from GPU (0 = keep loaded forever) |
-| `REQUEST_TIMEOUT` | `300` | Max seconds per inference request |
-| `LOG_LEVEL` | `INFO` | Log verbosity: `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| 变量 | 代码默认 | 含义 |
+|---|---|---|
+| `HOST` / `PORT` | `127.0.0.1` / `8765` | 监听地址 |
+| `MODEL_DIR` | `./models` | GGUF / ONNX / VAD |
+| `LLM_FN` | `qwen3_asr_llm.q5_k.gguf` | 解码器 |
+| `ONNX_PROVIDER` | `DML` | Encoder EP |
+| `LLM_USE_GPU` | `true` | Vulkan 解码 |
+| `WS_MAX_AUDIO_SECONDS` | `60` | 句长上限（必须 ≤ 60） |
+| `WS_EOS_SILENCE_MS` | `600` | 后端点静音 |
+| `WS_EARLY_SILENCE_MS` | `1000` | 短句（未 committed）更长静音 |
+| `WS_PARTIAL_SECONDS` | `1.5` | partial 间隔（`.env` 现为 `0.8`） |
+| `WS_SPECULATIVE_FINAL_MS` | `300` | 投机跑 final；`0`=关 |
+| `WS_CHUNK_COMMIT_MARGIN_MS` | `400` | 满 8s 窗文本冻结边距 |
+| `WS_VAD_PRE_ROLL_MS` | `400` | 起音 pre-roll |
+| `ASR_USE_SERVER_VAD` | `true` | 可被连接 query / `config` 覆盖 |
+| `UNLOAD_GRACE_S` | `0` | `0`=模型常驻 |
+| `REALTIME_CHUNK_SIZE_SEC` | `8` | 编码器窗，不要改默认 |
+| `LOG_DIR` | `./logs` | 按天滚动 |
+| `REQUEST_TIMEOUT` | `300` | 单次推理超时秒 |
+| `HOTWORD_ENABLED` | `true` | final 热词纠错 |
+| `HOTWORDS_PATH` | `./hotwords.txt` | 热词文件 |
 
-### WebSocket Streaming
+更细的状态机、队列、cache 见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。未做项见 [`docs/STREAMING_TODO.md`](docs/STREAMING_TODO.md)。
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WS_MAX_AUDIO_SECONDS` | `60` | Session PCM cap; then final + close (must be ≤ 60) |
-| `WS_EOS_SILENCE_MS` | `600` | Backend endpoint: silence after speech before audio is considered ended |
-| `WS_EARLY_SILENCE_MS` | `1000` | Longer silence required before ~0.8s of speech |
-| `WS_PARTIAL_SECONDS` | `1.5` | Partial emit interval |
-| `ASR_USE_SERVER_VAD` | `true` | Server-side VAD / EOS (overridable per-connection) |
-
-### Subtitles
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FORCED_ALIGNER_ID` | `Qwen/Qwen3-ForcedAligner-0.6B` | HuggingFace model for accurate mode alignment |
-| `SUBTITLE_MAX_DURATION` | `7.0` | Max duration per subtitle block (seconds) |
-| `SUBTITLE_PAUSE_THRESHOLD` | `0.5` | Pause duration that triggers subtitle break (seconds) |
-| `SUBTITLE_MIN_DURATION` | `0.833` | Minimum subtitle display time (seconds) |
-| `SUBTITLE_MIN_GAP` | `0.083` | Minimum gap between subtitles (seconds) |
-
-### SSE Streaming
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SSE_CHUNK_SECONDS` | `5` | Duration of each SSE chunk for long audio (seconds) |
-| `SSE_OVERLAP_SECONDS` | `1` | Overlap between SSE chunks (seconds) |
-
-### Performance & Quantization
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `QUANTIZE` | `""` | `int8` (bitsandbytes W8A8) or `fp8` (torchao, sm_89+) |
-| `USE_CUDA_GRAPHS` | `false` | Extra warmup passes for CUDA kernel caching |
-| `DUAL_MODEL` | `false` | Load 0.6B model for WebSocket partials alongside 1.7B |
-| `FAST_MODEL_ID` | `Qwen/Qwen3-ASR-0.6B` | Model used for partials/draft in dual/speculative mode |
-| `USE_SPECULATIVE` | `false` | Speculative decoding (0.6B draft + 1.7B verifier) |
-| `ONNX_ENCODER_PATH` | `""` | Path to exported ONNX encoder |
-| `TRT_ENCODER_PATH` | `""` | Path to compiled TensorRT engine |
-
-### Infrastructure
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATEWAY_MODE` | `false` | Run as gateway proxy + worker subprocess (recommended for production) |
-| `WORKER_HOST` | `127.0.0.1` | Worker host (used by gateway) |
-| `WORKER_PORT` | `8001` | Worker port (used by gateway) |
-| `NUMA_NODE` | `0` | NUMA node for CPU affinity (pins to GPU-collocated CPUs) |
-| `USE_GRANIAN` | `false` | Use Granian (Rust-based ASGI) instead of uvicorn |
-
-### Docker / CUDA
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | PyTorch CUDA memory allocator tuning |
-
-## Supported Audio Formats
-
-HTTP endpoints accept any format supported by libsndfile:
-**WAV, FLAC, MP3, OGG, AIFF, CAF, AU, W64, RF64**, and more.
-
-Not supported: MP4, AAC, M4A (soundfile limitation).
-
-WebSocket accepts **raw PCM only**: 16-bit little-endian, 16kHz, mono.
-
-## Project Structure
+## 目录
 
 ```
-qwen3-asr/
-├── compose.yaml          # Docker Compose configuration
-├── Dockerfile            # Container build (all deps pinned)
-├── .env.example          # Documented env var template
+stt-qwen3-realtime/
+├── run.py                 # 读 .env、单实例、启动 uvicorn
+├── .env                   # 本机配置（克隆后按路径改 MODEL_DIR / HOTWORDS_PATH）
+├── requirements.txt
 ├── src/
-│   ├── server.py         # FastAPI server — inference, WebSocket, SSE
-│   ├── gateway.py        # Gateway proxy (GATEWAY_MODE=true)
-│   ├── worker.py         # Inference worker subprocess
-│   ├── subtitle.py       # Subtitle generation (aligner, segmentation, SRT)
-│   ├── logger.py         # Loguru structured logging + uvicorn interception
-│   ├── schemas.py        # Pydantic models for Swagger UI documentation
-│   ├── config.py         # Config validation and extracted constants
-│   ├── errors.py         # Standardized error response helper
-│   ├── export_onnx.py    # Export encoder to ONNX Runtime
-│   ├── build_trt.py      # Build TensorRT encoder engine
-│   └── debug_audio.py    # Debug audio preprocessing locally
-├── E2Etest/              # pytest E2E test suite
+│   ├── server.py          # FastAPI + WebSocket 会话
+│   ├── inference_queue.py # 单线程 GPU 队列
+│   ├── vad.py             # Silero 后端点
+│   ├── backend/           # GGUF / ONNX 加载
+│   └── tray_app.py        # 绿色包托盘
+├── vendor/qwen_asr_gguf/  # 8s 分窗 ASR + encoder cache（不含 DLL）
+├── web/index.html
+├── E2Etest/
+├── packaging/             # 绿色包构建
 ├── docs/
-│   ├── WEBSOCKET_USAGE.md
-│   └── GRANIAN_BENCHMARK.md
-├── models/               # HuggingFace model cache (auto-populated)
-├── CHANGELOG.md
-├── ROADMAP.md
-└── LEARNING_LOG.md
+└── models/                # 本地模型，不进 git
 ```
 
-## License
+## 打包
 
-Apache 2.0
+不要直接压缩本仓库给人用。开发机：
+
+```powershell
+conda activate lingting
+pip install -r packaging/requirements-build.txt
+powershell -ExecutionPolicy Bypass -File packaging/build.ps1
+```
+
+产物：`dist/ASR-REALTIME/`（不含模型）。对方把 GGUF / ONNX / VAD 放进包内 `models/`，双击 `ASRRealtime.exe`。说明见 [`packaging/README.md`](packaging/README.md)。
+
+## 致谢
+
+- [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR)
+- [Qwen3-ASR-GGUF](https://github.com/HaujetZhao/Qwen3-ASR-GGUF)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
